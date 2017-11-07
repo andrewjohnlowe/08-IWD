@@ -1,0 +1,692 @@
+---
+title: "A VERY quick and dirty PoC for the IWD Use Case"
+author: "Andrew Lowe"
+date: "19 October 2017"
+output: 
+  html_document:
+    self_contained: no
+---
+
+```{r clean-up, echo = FALSE}
+# Delete leftovers (if any) from last session:
+rm(list = ls()) # Start fresh
+```
+
+The easiest way to import the data into R is to first export it from Spotfire as an Excel spreadsheet. (Unfortunately, exporting the data as a tab-delimited text file results in weird encoding issues that cause errors like "embedded nul in string" when using `read.table` or `fread` to read the data in R.)
+```{r, cache = TRUE}
+set.seed(42) # Set random number seed for the sake of reproducibility
+
+require(readxl)
+
+setwd("C:/Users/Andrew_Lowe/Downloads/Temp")
+dat <- read_xls("Data Table.xls")
+names(dat) # Print column names
+```
+
+Data cleaning...
+```{r}
+# Select the columns we need (according to Tamas Sarkadi <Tamas_Sarkadi@epam.com>):
+dat <- dat[, names(dat) %in% c(
+  "Category",
+  "Company",
+  "Brand",
+  "Form",                    
+  "Concentration",
+  "BasicSize",
+  "SecondBenefit",
+  "NumberOfJobs",          
+  "Item",
+  "ValueSalesMLC", # Target
+  "Date", # Timestamp
+  "WeightedDistribution", # Feature
+  "WDFeature", # Feature
+  "WDDisplay", # Feature
+  "WDPriceCut", # Feature
+  "PPSU" # Feature
+)]
+names(dat)
+```
+
+Data cleaning...
+```{r}
+strip.single.valued <- function(df) {
+  only.one.value <- sapply(df, function(x) length(unique(x)) == 1) # Count unique values
+  str(df[1, only.one.value]) # These columns only have one unique value!
+  df <- df[, !only.one.value] # Remove those columns
+  return(df)
+}
+
+dat <- strip.single.valued(dat) # Do it
+```
+
+Data cleaning...
+```{r}
+require(lubridate)
+dat$Date <- ymd(dat$Date) # Transform into Date object
+```
+
+Data cleaning...
+```{r remove-duplicate-features}
+# Remove columns with duplicate entries by fast comparison of hashes:
+require(digest)
+duplicate.columns <- names(dat)[duplicated(lapply(dat, digest))]
+if(length(duplicate.columns) == 0) {# Are there any duplicate columns?
+  print("No duplicated columns")
+} else {
+  print(duplicate.columns)
+}
+
+dat <- dat[, !names(dat) %in% duplicate.columns]
+names(dat)
+```
+
+Change strings to factors...
+```{r}
+require(dplyr)
+dat <- dat %>% mutate_if(is.character, as.factor)
+str(dat)
+```
+
+Data cleaning...
+```{r}
+dat <- dat %>% 
+  select(-one_of("Date")) %>% # Remove date column; we'll not treat the data as time series
+  filter(complete.cases(.)) # Remove rows with missing values
+names(dat)
+```
+
+```{r}
+dat$pathString <- paste(
+  dat[["Category"]],
+  dat[["Company"]],
+  dat[["Brand"]],
+  dat[["Form"]],
+  dat[["Concentration"]],
+  dat[["SecondBenefit"]],
+  dat[["NumberOfJobs"]],
+  dat[["BasicSize"]],
+  dat[["Item"]],
+  sep = ">")
+head(dat$pathString)
+```
+
+```{r}
+first.diffs <- function(df) {
+  df %>%
+    mutate_all(funs(. - lag(.))) %>%
+    na.omit()
+}
+```
+
+Split the hierarchical data structure into a list of data.frames, one for each product:
+```{r}
+prods <- split(dat, dat$pathString)
+length(prods)
+```
+
+
+
+Number of data points per partition:
+```{r}
+summary(sapply(prods, nrow))
+hist(sapply(prods, nrow), breaks = 30)
+head(sort(sapply(prods, nrow)))
+```
+
+Remove products that have less than some threshold number of data points:
+```{r}
+prods <- prods[which(sapply(prods, nrow) >= 50)]
+length(prods)
+
+summary(sapply(prods, nrow))
+hist(sapply(prods, nrow), breaks = 30)
+head(sort(sapply(prods, nrow)))
+```
+
+```{r}
+require(mlr)
+
+# 3-fold cross-validation
+rdesc <- makeResampleDesc("RepCV", folds = 5, reps = 5)
+rdesc
+```
+
+```{r}
+# Define the learner
+lrn <- makeLearner("regr.randomForest")
+lrn
+```
+
+```{r}
+r <- lapply(seq_len(length(prods)), function(x) {
+  suppressWarnings({
+    if(!(x %% 10)) print(x)
+    resample(lrn, 
+             makeRegrTask(id = "IWD", 
+                          data = first.diffs(
+                            prods[[x]][, names(prods[[x]]) %in% 
+                                         c("ValueSalesMLC",
+                                           "WeightedDistribution",
+                                           "WDDisplay",           
+                                           "WDFeature", 
+                                           "WDPriceCut", 
+                                           "PPSU")]), 
+                          target = "ValueSalesMLC")
+             ,
+             rdesc, 
+             measures = list(rsq, arsq, mse, rmse),
+             show.info = FALSE)
+  })
+}
+)
+perf <- sapply(seq_len(length(prods)), function(t) r[[t]]$aggr)
+```
+
+```{r}
+perf <- as.data.frame(t(perf))
+colMeans(perf)
+```
+
+```{r}
+apply(perf, 2, summary)
+```
+
+```{r}
+hist(perf$rsq.test.mean, breaks = 30)
+perf$n.points <- sapply(prods, nrow)
+```
+
+```{r}
+with(perf, plot(n.points, rsq.test.mean, ylim = c(-5,1)))
+```
+
+```{r}
+require(ggplot2)
+ggplot(perf, aes(x = n.points, y = rsq.test.mean)) +
+  geom_point() +
+  geom_smooth(method = "loess") +
+  coord_cartesian(ylim = c(-5, 1))
+```
+
+```{r}
+knit_exit()
+```
+
+```{r}
+plotLearnerPrediction(lrn, features = c("WDPriceCut", "PPSU"), task = task)
+```
+
+Does ValueSalesMLC predict the various product attributes? Just trying to get a clue of what groups we might aggregate over with minimal lost of information that might be leveraged to predict the target.
+```{r}
+require(CORElearn)
+attrs <- names(dat)[1:8]
+attrs <- sapply(attrs, function(s) as.formula(paste0(s, " ~ ValueSalesMLC")))
+
+imp <- sapply(attrs, attrEval, dat, estimator = "Gini")
+par(las = 2) # make label text perpendicular to axis
+par(mar = c(5, 18, 4, 2)) # increase y-axis margin.
+barplot(imp, horiz = TRUE)
+
+imp <- sapply(attrs, attrEval, dat, estimator = "InfGain")
+par(las = 2) # make label text perpendicular to axis
+par(mar = c(5, 18, 4, 2)) # increase y-axis margin.
+barplot(imp, horiz = TRUE)
+
+imp <- sapply(attrs, attrEval, dat, estimator = "GainRatio")
+par(las = 2) # make label text perpendicular to axis
+par(mar = c(5, 18, 4, 2)) # increase y-axis margin.
+barplot(imp, horiz = TRUE)
+```
+
+SecondBenefit, Concentration and Form look like candidates.
+
+```{r}
+require(data.tree)
+dat <- dat[1:1000,]
+# dat$pathString <- paste(make.names("LAUNDRY DETERGENTS V2 CATEGORY"),
+#                         dat$Company,
+#                         dat$Brand,
+#                         dat$Form,
+#                         dat$Concentration,
+#                         dat$BasicSize,
+#                         dat$SecondBenefit,
+#                         dat$NumberOfJobs,
+#                         dat$Item,
+#                         sep = ">")
+dat$pathString <- paste("Products", dat$Company, dat$Brand, dat$Form, sep="|")
+
+```
+
+```{r}
+require(networkD3)
+
+dat.df <- as.data.frame(dat)
+#define the hierarchy (Session/Room/Speaker)
+dat.df$pathString <- paste("LAUNDRY DETERGENTS V2 CATEGORY", 
+                           dat$Company, 
+                           dat$Brand, 
+                           dat$Form, 
+                           dat$Concentration, 
+                           dat$BasicSize, 
+                           dat$SecondBenefit, 
+                           dat$NumberOfJobs, 
+                           #dat$Item, 
+                           sep=">")
+#convert to Node
+dat.tree <- as.Node(dat.df, pathDelimiter = ">")
+
+#plot with networkD3
+dat.treeList <- ToListExplicit(dat.tree, unname = TRUE)
+diagonalNetwork(dat.treeList)
+
+```
+
+
+```{r}
+library(treemap)
+library(d3treeR)
+# basic treemap
+p=treemap(dat,
+            index=c("Company","Brand","Form","Concentration","BasicSize"),
+            vSize="ValueSalesMLC",
+            type="value"
+            )            
+ 
+# make it interactive ("rootname" becomes the title of the plot):
+```
+
+```{r}
+d3tree( p ,  rootname = "General" )
+d3tree2( p ,  rootname = "General" )
+```
+
+```{r,results='asis'}
+require(d3Network)
+
+d3Tree(dat.treeList)
+
+knitr::knit_exit()
+```
+Do the drill-down:
+```{r}
+require(dplyr)
+select.product <- function(df, 
+                           # selected.Category, 
+                           selected.Company, 
+                           selected.Brand, 
+                           # selected.Form, 
+                           # selected.Concentration, 
+                           selected.BasicSize, 
+                           # selected.SecondBenefit, 
+                           selected.NumberOfJobs, 
+                           selected.Item) {
+  # Filter and then remove the column, because it now contains no useful info:
+  dat %>% 
+    # filter(Category == selected.Category) %>%
+    filter(Company == selected.Company) %>% 
+    filter(Brand == selected.Brand) %>% 
+    # filter(Form == selected.Form) %>%
+    # filter(Concentration == selected.Concentration) %>%
+    filter(BasicSize == selected.BasicSize) %>%
+    # filter(SecondBenefit == selected.SecondBenefit) %>%
+    filter(NumberOfJobs == selected.NumberOfJobs) %>%
+    filter(Item == selected.Item)
+}
+```
+
+```{r}
+
+
+prod.ts <- dat %>% 
+  select.product(
+    # selected.Category = "LAUNDRY DETERGENTS V2 CATEGORY",
+    selected.Company = "RETAILER BRAND COMPANIES",
+    selected.Brand = "RETAILER BRAND",
+    selected.Form = "POWDER",
+    selected.Concentration = "REGULAR",
+    selected.BasicSize = "800GR",
+    selected.SecondBenefit = "COLOUR",
+    selected.NumberOfJobs = "10",
+    selected.Item = "+TSO * REG LNDTG PWD 1CT   800GR"
+  ) %>% 
+  filter(complete.cases(.)) # Remove cases with missing values
+prod <- prod.ts %>% dplyr::select(-one_of("Date")) # This isn't a feature; remove it
+names(prod)
+```
+
+
+```{r}
+require(viridis)
+require(car)
+require(rgl)
+scatter3d(ValueSalesMLC ~ PPSU + I(WDPriceCut - WeightedDistribution), data = dat, fit = "smooth", id.method = "identify", labels = dat$Item, point.col = viridis(length(unique(dat$Brand)))[as.factor(dat$Brand)], residuals = FALSE)
+knitr::knit_exit()
+```
+
+Create design matrix:
+```{r}
+Y <- dat$ValueSalesMLC
+dm <- as.data.frame(model.matrix(ValueSalesMLC ~ . -1, data = dat))
+dm$ValueSalesMLC <- Y
+names(dm) <- make.names(names(dm)) # Make syntantically-correct names
+```
+
+Partition the data for training and testing:
+```{r}
+require(caret)
+trainIndex <- createDataPartition(dm$ValueSalesMLC, p = 0.8, 
+                                  list = FALSE, 
+                                  times = 1)
+train <- dm[trainIndex,]
+test <- dm[-trainIndex,]
+```
+
+
+
+
+
+```{r}
+require(ranger)
+dm2 <- train
+mod.rf <- ranger(ValueSalesMLC ~ ., data = dm2, importance = "impurity", verbose = TRUE)
+```
+
+```{r}
+mod.rf
+imp <- importance(mod.rf)
+head(imp[order(imp, decreasing = TRUE)])
+```
+
+
+
+```{r}
+dat2 <- dat %>% dplyr::select(-one_of("Date")) %>% filter(complete.cases(.))
+```
+
+```{r}
+dat2 <- dat2 %>% mutate_if(is.character,as.factor)
+```
+
+```{r}
+require(CORElearn)
+feats <- names(dat2)[1:8]
+feats <- sapply(feats, function(s) as.formula(paste0("ValueSalesMLC~",s)))
+rr <- sapply(feats, attrEval, dat2, estimator = "RReliefFequalK")
+par(las=2) # make label text perpendicular to axis
+par(mar=c(5,18,4,2)) # increase y-axis margin.
+
+barplot(rr, horiz = T)
+#attrEval(feats[[2]], dat2, estimator = "InfGain")
+```
+
+
+```{r}
+require(caret)
+feats <- names(dat2)[1:2]
+feats <- sapply(feats, function(s) as.formula(paste0(s, "~ ValueSalesMLC + WeightedDistribution")))
+control <- caret::trainControl(method="cv", number=3, verboseIter = TRUE)
+model <- lapply(feats, caret::train, data = dat2, method="nb", trControl=control)
+model$results[rownames(model$bestTune),]
+```
+
+```{r}
+control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+model <- train(diabetes~., data=PimaIndiansDiabetes, method="lvq", preProcess="scale", trControl=control)
+# estimate variable importance
+importance <- varImp(model, scale=FALSE)
+```
+
+
+```{r}
+require(CORElearn)
+
+```
+
+If we did the drill-down correctly, what we have left should contain only single values for the columns that we filtered on. If this is not the case, we have a problem.
+```{r}
+prod <- strip.single.valued(prod) # Remove columns that contain only one value
+```
+
+
+Partition the data for training and testing:
+```{r}
+require(caret)
+trainIndex <- createDataPartition(prod$ValueSalesMLC, p = 0.8, 
+                                  list = FALSE, 
+                                  times = 1)
+train <- prod[trainIndex,]
+test <- prod[-trainIndex,]
+```
+
+Create design matrix:
+```{r}
+Y <- train$ValueSalesMLC
+X <- model.matrix(ValueSalesMLC ~ . -1, data = train)
+```
+
+Fit on the data using *Elastic Net*; perform CV to choose model:
+```{r}
+require(glmnet)
+a <- 0.5 # Between LASSO and ridge
+cvfit <- cv.glmnet(X, Y, type.measure = "mse", nfolds = 10, alpha = a) # 10-fold CV
+```
+
+The following plot shows the performance for multiple models, one for each value of the regularisation parameter $\lambda$; the number at the top of the plot denote the number of variables in the model (fewer variables to the right, implying a simpler model). The right-most dotted vertical line corresponds to the simplest model that is not statistically different (is within 1$\sigma$) of the best model.
+```{r}
+plot(cvfit)
+```
+
+Extract the model coefficients; those that are non-zero are important. 
+```{r}
+# The simplest model that is statistically compatible with the best performing
+# model; that is, there is no statistically significant difference:
+coef(cvfit, s = "lambda.1se")
+lambda.1se <- cvfit$lambda.1se
+lambda.min <- cvfit$lambda.min
+lambdas <- data.frame(lambda.1se = lambda.1se, lambda.min = lambda.min)
+lambdas
+log(lambdas)
+```
+
+Now we fit the model and plot the coefficients for the value of the regularisation parameter $\lambda$ that was selected using CV in the previous step. The dotted line corresponds to the value of $\lambda$. The absolute value of the coefficient for a variable corresponds to variable importance.
+
+**This satisfies the first requirement of the Use Case: the identification of the variables that are most important for driving sales performance.**
+```{r}
+fit <- glmnet(X, Y, alpha = a)
+par(mar = c(4.5, 4.5, 1, 4))
+plot(fit, xvar = "lambda")
+vnat <- coef(cvfit)
+# Remove the intercept, and get the coefficients:
+vnat <- vnat[-1, ncol(vnat)] 
+axis(4, 
+     at = vnat, 
+     line = -0.75, 
+     label = names(vnat), 
+     las = 1, 
+     tick = FALSE, 
+     cex.axis = 0.5)
+abline(v = log(lambda.1se), lty = "dotted")
+```
+
+Create design matrix:
+```{r}
+Y <- test$ValueSalesMLC
+X <- model.matrix(ValueSalesMLC ~. -1, data = test)
+```
+
+We can now make predictions with new data. **This satifies the second and final requirement; that is, to produce a predictive model.**
+```{r}
+preds <- predict(fit, newx = X, s = lambda.1se, type = "response")
+```
+
+Root mean squared error and $R^2$:
+```{r}
+postResample(pred = preds, obs = Y)
+```
+
+Not too good. What's up? Let's plot the data. It looks like most of the points are on the borders. That looks like a problem.
+```{r}
+df <- as.data.frame(prod)
+featurePlot(x = df[,-1], y = cut(df[,1], breaks = 10), plot = "pairs")
+```
+With pairwise feature interactions:
+```{r}
+Y <- prod$ValueSalesMLC
+X <- model.matrix(ValueSalesMLC ~.^2 -1, data = prod)
+df <- as.data.frame(X)
+df <- cbind(df, Y)
+featurePlot(x = df[,-(ncol(df))], y = cut(df$Y, breaks = 10), plot = "pairs")
+```
+
+H'mm. Looks like multivariate linear regression is not a good fit.
+```{r}
+x <-range(prod$WeightedDistribution)
+x <- seq(x[1], x[2], length.out = 50)
+
+y <- range(prod$WDPriceCut)
+y <- seq(y[1], y[2], length.out = 50)
+
+ValueSalesMLC <- outer(x, y,
+                       function(WeightedDistribution, WDPriceCut, PPSU = 0)
+                         predict(
+                           cvfit, 
+                           newx = as.matrix(
+                             data.frame(
+                               WeightedDistribution, 
+                               WDPriceCut, 
+                               PPSU # Dummy variable in this plot
+                             )
+                           )
+                         )
+)
+
+p <- persp(x, y, ValueSalesMLC, theta = 30, phi = 30, 
+           col = "lightblue", expand = 0.5, shade = 0.2,
+           xlab = "WeightedDistribution", 
+           ylab = "WDPriceCut", 
+           zlab = "ValueSalesMLC")
+
+obs <- trans3d(prod$WeightedDistribution, prod$WDPriceCut, prod$ValueSalesMLC, p)
+points(obs, col = "red", pch = 16)
+```
+
+```{r, eval = FALSE}
+# Interactive plots:
+require(car)
+require(rgl)
+scatter3d(ValueSalesMLC ~ WeightedDistribution + WDPriceCut, data = prod, fit = "linear")
+scatter3d(ValueSalesMLC ~ WeightedDistribution + WDPriceCut, data = prod, fit = "smooth")
+```
+
+Let's try generalized additive model using splines:
+```{r}
+Control <- trainControl(method = "repeatedcv", repeats = 5, verboseIter = FALSE)
+
+Y <- train$ValueSalesMLC
+X <- model.matrix(ValueSalesMLC ~ . -1, data = train)
+
+mod <- train(x = X, y = Y,
+             method = "gam",
+             trControl = Control)
+
+imp <- varImp(mod)
+plot(imp)
+```
+
+```{r}
+Y <- test$ValueSalesMLC
+X <- model.matrix(ValueSalesMLC ~ . -1, data = test)
+preds <- predict(mod, newdata = X)
+postResample(pred = preds, obs = Y)
+```
+Much better!
+```{r}
+x <-range(prod$WeightedDistribution)
+x <- seq(x[1], x[2], length.out = 50)
+y <- range(prod$WDPriceCut)
+y <- seq(y[1], y[2], length.out = 50)
+
+ValueSalesMLC <- outer(x, y,
+                       function(WeightedDistribution, WDPriceCut, PPSU = 0)
+                         predict(mod, 
+                                 newdata = as.matrix(
+                                   data.frame(
+                                     WeightedDistribution, 
+                                     WDPriceCut, 
+                                     PPSU # Not used
+                                   )
+                                 )
+                         )
+)
+
+p <- persp(x, y, ValueSalesMLC, theta = 40, phi = 30, 
+           col = "lightblue", expand = 0.5, shade = 0.2,
+           xlab = "WeightedDistribution", ylab = "WDPriceCut", zlab = "ValueSalesMLC")
+
+obs <- trans3d(prod$WeightedDistribution, prod$WDPriceCut, prod$ValueSalesMLC, p)
+points(obs, col = "red", pch = 16)
+```
+
+The data is too sparse in places to do much with; for some items there are very few data points:
+```{r}
+head(data.frame(sort(table(sort(dat$Item)))))
+tail(data.frame(sort(table(sort(dat$Item)))))
+```
+
+Let's average the performance of all products with, say, more than 250 data points without missing data (there are few items satisfying this constrain; more items implies a **much** longer training time):
+```{r}
+DT <- dat[, !names(dat) %in% "Date"]
+tab <- data.frame(table(sort(DT[complete.cases(DT),]$Item)))
+items <- tab[tab$Freq >= 250, "Var1"]
+
+do.it <- function(selected.Item = xItem) {
+  # print(xItem)
+  # print(dim(DT %>% filter(Item == selected.Item) %>% filter(complete.cases(.))))
+  
+  DT %>% filter(Item == selected.Item) %>% 
+    filter(complete.cases(.)) %>% 
+    select(-one_of("Company")) %>% 
+    select(-one_of("Brand")) %>% 
+    select(-one_of("Form")) %>% 
+    select(-one_of("Concentration")) %>% 
+    select(-one_of("BasicSize")) %>% 
+    select(-one_of("SecondBenefit")) %>% 
+    select(-one_of("NumberOfJobs")) %>% 
+    select(-one_of("Item")) -> thisProd.DT
+  trainIndex <- createDataPartition(thisProd.DT$ValueSalesMLC, p = .8, 
+                                    list = FALSE, 
+                                    times = 1)
+  
+  # print(dim(thisProd.DT))
+  
+  train <- thisProd.DT[trainIndex,]
+  test <- thisProd.DT[-trainIndex,]
+  
+  # print(dim(train))
+  # print(dim(test))
+  
+  Control <- trainControl(method = "repeatedcv", repeats = 5, verboseIter = FALSE)
+  
+  Y <- train$ValueSalesMLC
+  X <- model.matrix(ValueSalesMLC ~ . -1, data = train)
+  
+  mod <- train(x = X, y = Y,
+               method = "gam",
+               trControl = Control)
+  
+  Y <- test$ValueSalesMLC
+  X <- model.matrix(ValueSalesMLC ~ . -1, data = test)
+  preds <- predict(mod, newdata = X)
+  return(postResample(pred = preds, obs = Y))
+}
+
+results <- sapply(items, function(xItem) do.it(as.character(xItem)))
+```
+
+```{r}
+summary(t(results))
+apply(results, 1, sd)
+boxplot(as.data.frame(t(results))[,1, drop = FALSE], main = "RMSE")
+boxplot(as.data.frame(t(results))[,2, drop = FALSE], main = "Rsquared")
+```
